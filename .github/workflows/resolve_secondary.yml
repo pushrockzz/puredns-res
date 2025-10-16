@@ -1,0 +1,143 @@
+name: PureDNS Resolution Worker (Secondary)
+
+on:
+  workflow_dispatch:
+    inputs:
+      primary_repo:
+        description: 'The owner/repo of the primary workflow (e.g., Pcoder7/puredns-res)'
+        required: true
+        type: string
+      primary_run_id:
+        description: 'The run ID of the primary workflow for artifact correlation.'
+        required: true
+        type: string
+      chunk_package_artifact_name:
+        description: 'The exact name of the artifact package to download.'
+        required: true
+        type: string
+      matrix_json:
+        description: 'The JSON string representing the matrix of chunks assigned to this worker.'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  process_assigned_chunks:
+    name: Process Chunk (${{ matrix.pair.chunk }})
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/pcoder7/spider-puredns-actions:latest
+      credentials:
+        username: ${{ secrets.GHCR_USER }}
+        password: ${{ secrets.GHCR_TOKEN }}
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        pair: ${{ fromJson(github.event.inputs.matrix_json || '[]') }}
+    steps:
+      - name: Display Trigger Payload (Debug)
+        run: |
+          echo "SECONDARY WORKER: Received payload:"
+          echo "Primary Repo: ${{ github.event.inputs.primary_repo }}"
+          echo "Primary Run ID: ${{ github.event.inputs.primary_run_id }}"
+          echo "Artifact Name: ${{ github.event.inputs.chunk_package_artifact_name }}"
+          echo "---"
+          echo "Assigned Chunk for this job: ${{ toJson(matrix.pair) }}"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Chunks Package from Primary Workflow
+        env:
+          GH_TOKEN: ${{ secrets.PAT_FOR_PRIMARY_ARTIFACTS_READ }}
+          PRIMARY_REPO: ${{ github.event.inputs.primary_repo }}
+          PRIMARY_RUN_ID: ${{ github.event.inputs.primary_run_id }}
+          ARTIFACT_NAME: ${{ github.event.inputs.chunk_package_artifact_name }}
+        shell: bash
+        run: |
+          set -e
+          echo "SECONDARY WORKER: Downloading artifact '$ARTIFACT_NAME' from '$PRIMARY_REPO', run ID '$PRIMARY_RUN_ID'"
+          
+          # Install GitHub CLI
+          apt-get update -qy && apt-get install -qy curl
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          apt-get update -qy && apt-get install -qy gh
+
+          # Download artifact
+          gh run download "$PRIMARY_RUN_ID" -R "$PRIMARY_REPO" -n "$ARTIFACT_NAME" --dir .
+          
+          if [ ! -d "chunks" ]; then
+            echo "::error:: Artifact download failed or did not contain the 'chunks' directory."
+            exit 1
+          fi
+          echo "Artifact downloaded successfully."
+          ls -l
+
+      - name: Resolve, Filter, Scan, and Sort
+        id: resolve_and_sort
+        shell: bash
+        run: |
+          # This entire block is a direct copy of the processing logic from the Primary workflow
+          # to ensure 100% consistency in results.
+          set -e
+          CHUNK_FILE="${{ matrix.pair.chunk }}"
+          JOB_OUTPUT_DIR="job_output"
+          mkdir -p "$JOB_OUTPUT_DIR"
+
+          echo "Processing chunk: '$CHUNK_FILE'..."
+          if [ ! -s "$CHUNK_FILE" ]; then
+            echo "Chunk file is empty. Exiting."
+            exit 0
+          fi
+          
+          # 1. Resolve with sanicdns (and required setup)
+          chmod +x scripts/install-sanicdns.sh && scripts/install-sanicdns.sh
+          SANICDNS_OUT="$JOB_OUTPUT_DIR/sanicdns_output.txt"
+          sudo sanicdns \
+            -i "$CHUNK_FILE" -r 1000 -c 3000 \
+            --resolvers resolvers-trusted.txt \
+            -o "$SANICDNS_OUT" -w 4 --num-retries 7 --timeout 7000
+
+          # 2. Filter and Process IPs
+          FILTER_OUT="$JOB_OUTPUT_DIR/sanicdns_filter.txt"
+          IP_LIST="$JOB_OUTPUT_DIR/ip_list.txt"
+          NON_CDN_IP="$JOB_OUTPUT_DIR/non_cdn_ip.txt"
+          SMAP_OUT="$JOB_OUTPUT_DIR/smap.txt"
+          SUBDOMAIN_PORTS="$JOB_OUTPUT_DIR/subdomains_ports.txt"
+          
+          jq -r 'select(.data.answers | any(.type=="A")) | .name | rtrimstr(".")' "$SANICDNS_OUT" | anew -q "$FILTER_OUT"
+          jq -r 'select(.data.answers | any(.type=="A")) | .data.answers[] | select(.type == "A") | .data' "$SANICDNS_OUT" | sort -u > "$IP_LIST"
+          
+          cat "$IP_LIST" | cut-cdn -ua -silent -o "$NON_CDN_IP"
+          grep -Fxv -f "$NON_CDN_IP" "$IP_LIST" > "$JOB_OUTPUT_DIR/cdn_ip.txt" || true
+          
+          if [ -s "$NON_CDN_IP" ]; then smap -iL "$NON_CDN_IP" -oP "$SMAP_OUT"; else touch "$SMAP_OUT"; fi
+          
+          touch "$SUBDOMAIN_PORTS"
+          chmod +x map_IP_to_HOST.py
+          if [ -s "$SMAP_OUT" ]; then ./map_IP_to_HOST.py "$SANICDNS_OUT" "$SMAP_OUT" | anew -q "$SUBDOMAIN_PORTS"; fi
+          if [ -s "$JOB_OUTPUT_DIR/cdn_ip.txt" ]; then ./map_IP_to_HOST.py "$SANICDNS_OUT" "$JOB_OUTPUT_DIR/cdn_ip.txt" | anew -q "$SUBDOMAIN_PORTS"; fi
+
+          # 3. Sort results into root domain folders
+          FINAL_SORTED_DIR="final_sorted"
+          mkdir -p "$FINAL_SORTED_DIR"
+          
+          while read -r root_domain; do
+            if [ -z "$root_domain" ]; then continue; fi
+            mkdir -p "$FINAL_SORTED_DIR/$root_domain"
+            grep -E "(^|\\.)${root_domain//./\\.}(\$|:)" "$SUBDOMAIN_PORTS" | anew -q "$FINAL_SORTED_DIR/$root_domain/subdomains_ports.txt" || true
+            grep -E "(^|\\.)${root_domain//./\\.}(\$)" "$FILTER_OUT" | anew -q "$FINAL_SORTED_DIR/$root_domain/resolved_subdomains.txt" || true
+          done < root_domains.txt
+
+      - name: Upload Sorted Job Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: job-results-secondary-${{ github.event.inputs.primary_run_id }}-${{ strategy.job-index }}
+          path: final_sorted/
+          retention-days: 1
