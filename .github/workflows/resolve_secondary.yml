@@ -3,16 +3,28 @@ name: PureDNS Resolution Worker (Secondary)
 on:
   workflow_dispatch:
     inputs:
-      primary_repo:
-        description: 'The owner/repo of the primary workflow (e.g., Pcoder7/puredns-res)'
-        required: true
-        type: string
       primary_run_id:
         description: 'The run ID of the primary workflow for artifact correlation.'
         required: true
         type: string
+      primary_github_server_url:
+        description: 'The server URL of the primary GitHub instance (e.g., https://github.com)'
+        required: true
+        type: string 
+      primary_repo:
+        description: 'The owner/repo of the primary workflow'
+        required: true
+        type: string
+      primary_repo_owner:
+        description: 'The owner of the primary repository that triggered this workflow.'
+        required: true
+        type: string
+      primary_repo_name:
+        description: 'The name of the primary repository that triggered this workflow.'
+        required: true
+        type: string  
       chunk_package_artifact_name:
-        description: 'The exact name of the artifact package to download.'
+        description: 'The name of the artifact package containing all chunks and resolvers.'
         required: true
         type: string
       matrix_json:
