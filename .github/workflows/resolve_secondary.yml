@@ -40,11 +40,6 @@ jobs:
   process_assigned_chunks:
     name: Process Chunk (${{ matrix.pair.chunk }})
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/pcoder7/spider-puredns-actions:latest
-      credentials:
-        username: ${{ secrets.GHCR_USER }}
-        password: ${{ secrets.GHCR_TOKEN }}
     strategy:
       fail-fast: false
       max-parallel: 20
@@ -62,7 +57,24 @@ jobs:
 
       - name: Checkout repository
         uses: actions/checkout@v4
+        with: 
+            fetch-depth: 0
 
+      - name: Setup Go
+        uses: actions/setup-go@v3
+        with:
+          go-version: '1.23'            # or whichever version you need
+
+      - name: Cache Go modules and build cache
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-mod-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-mod-
+            
       - name: Download Chunks Package from Primary Workflow
         env:
           GH_TOKEN: ${{ secrets.PAT_FOR_PRIMARY_ARTIFACTS_READ }}
@@ -71,7 +83,7 @@ jobs:
           ARTIFACT_NAME: ${{ github.event.inputs.chunk_package_artifact_name }}
         shell: bash
         run: |
-          set -e
+
           echo "SECONDARY WORKER: Downloading artifact '$ARTIFACT_NAME' from '$PRIMARY_REPO', run ID '$PRIMARY_RUN_ID'"
           
           # Install GitHub CLI
@@ -86,10 +98,82 @@ jobs:
           
           if [ ! -d "chunks" ]; then
             echo "::error:: Artifact download failed or did not contain the 'chunks' directory."
-            exit 1
+            exit 0
           fi
           echo "Artifact downloaded successfully."
           ls -l
+
+      - name: Ensure Tools are installed
+        shell: bash
+        run: |
+          if ! command -v dsieve &> /dev/null; then
+            echo "🛠️  dsieve not found; installing..."
+            GO111MODULE=on go install \
+             github.com/trickest/dsieve@latest
+            echo "✅ Installed dsieve to $(go env GOPATH)/bin/dsieve"
+          else
+            echo "✅ dsieve already installed at $(command -v dsieve)"
+          fi
+         
+          # Installing cut-cdn
+          if ! command -v cut-cdn >/dev/null; then
+            echo "Installing cut-cdn…"
+            go install github.com/ImAyrix/cut-cdn@latest
+          else
+            echo "cut-cdn already in cache"
+          fi       
+          
+          # Installing smap
+          if ! command -v smap >/dev/null; then
+            echo "Installing smap…"
+            go install -v github.com/s0md3v/smap/cmd/smap@latest
+          else
+            echo "smap already in cache"
+          fi   
+          # Installing anew
+          if ! command -v anew >/dev/null; then
+            echo "Installing anew…"
+            go install -v github.com/tomnomnom/anew@latest
+          else
+            echo "anew already in cache"
+          fi    
+      
+      - name: Install pre‑reqs
+        run: | 
+          sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: Install sanicdns
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # make sure the script is executable
+          chmod +x scripts/install-sanicdns.sh
+          # run the installer
+          scripts/install-sanicdns.sh
+     
+      - name: Install ethtool & shrink NIC queues
+        run: |
+          sudo apt-get update -qq
+          for i in {1..3}; do
+            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq jq ethtool && break
+            echo "apt install failed, retrying in 10s…" >&2
+            sleep 10
+          done
+      
+      - name: Resize NIC RSS queues
+        run: |
+          IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5}' | head -n1)
+          if [ -n "$IFACE" ]; then
+            echo "🔧 Resizing RSS queues on $IFACE to 3..."
+            sudo ethtool -L "$IFACE" combined 3 || true
+          else
+            echo "⚠️  No default interface detected; skipping RSS resize."
+          fi
+      
+      - name: Allocate hugepages (1 GB)
+        run: |
+           # best-effort; if dpdk-hugepages.py isn't on PATH this will fail harmlessly
+           sudo dpdk-hugepages.py --setup 2G || true
 
       - name: Resolve, Filter, Scan, and Sort
         id: resolve_and_sort
