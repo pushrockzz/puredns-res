@@ -251,3 +251,143 @@ jobs:
           name: job-results-secondary-${{ github.event.inputs.primary_run_id }}-${{ strategy.job-index }}
           path: final_sorted/
           retention-days: 1
+
+# This is a new job that only merges artifacts
+  merge_results:
+    name: Merge All Distributed Results
+    needs: process_assigned_chunks
+    runs-on: ubuntu-latest
+    if: always()
+    outputs:
+      has_results: ${{ steps.consolidate.outputs.has_results }}
+    steps:
+      - name: Download All Job Results from All Workflows
+        env:
+          GH_TOKEN: ${{ secrets.PAT_FOR_PRIMARY_ARTIFACTS_READ }}
+        shell: bash
+        run: |
+          
+          # Install gh-cli if not present
+          sudo apt-get update -qy && sudo apt-get install -qy curl && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /usr/share/keyrings/githubcli-archive-keyring.gpg > /dev/null && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null && sudo apt-get update -qy && sudo apt-get install -qy gh
+          
+          echo "Downloading all artifacts from primary run ID: ${{ github.event.inputs.primary_run_id }}"
+          gh run download ${{ github.event.inputs.primary_run_id }} \
+            -R ${{ github.event.inputs.primary_repo }} \
+            -p 'job-results-*' \
+            --dir temp-aggregated-results
+          
+          if [ -z "$(ls -A temp-aggregated-results)" ]; then
+            echo "::warning:: No result artifacts found from any worker. Nothing to merge."
+            echo "HAS_RESULTS=false" >> $GITHUB_ENV
+          else
+            echo "HAS_RESULTS=true" >> $GITHUB_ENV
+          fi
+
+      - name: Consolidate and De-duplicate All Results
+        id: consolidate
+        if: env.HAS_RESULTS == 'true'
+        shell: bash
+        run: |
+          FINAL_RESULTS_DIR="final-results"
+          mkdir -p "$FINAL_RESULTS_DIR"
+          echo "Aggregating results..."
+          find temp-aggregated-results -mindepth 1 -type d -exec cp -r {}/. "$FINAL_RESULTS_DIR" \;
+          echo "De-duplicating all result files..."
+          find "$FINAL_RESULTS_DIR" -type f -name "*.txt" -exec sort -u -o {} {} \;
+          echo "has_results=true" >> $GITHUB_OUTPUT
+          ls -R "$FINAL_RESULTS_DIR"
+
+      - name: Upload Consolidated Artifact for Commit Job
+        if: steps.consolidate.outputs.has_results == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: consolidated-results-${{ github.event.inputs.primary_run_id }}
+          path: final-results/
+          retention-days: 1
+
+  # This is the new, separate job for committing
+  commit_results:
+    name: Commit Results to store-recon
+    needs: merge_results
+    runs-on: ubuntu-latest
+    if: always() && needs.merge_results.outputs.has_results == 'true'
+    steps:
+      - name: Download Consolidated Results
+        uses: actions/download-artifact@v4
+        with:
+          name: consolidated-results-${{ github.event.inputs.primary_run_id }}
+          path: final-results
+
+      - name: Commit to 'store-recon' Repository
+        env:
+          STORE_RECON_PAT: ${{ secrets.STORE_RECON_PAT_WRITE }}
+          STORE_RECON_REPO: ${{ secrets.STORE_RECON_REPO }}
+          # The Correlation ID is taken directly from the trigger input
+          CORRELATION_ID: ${{ github.event.inputs.primary_run_id }}
+        run: |
+          
+          RESULTS_DIR="${GITHUB_WORKSPACE}/final-results"
+          CLONE_DIR="${GITHUB_WORKSPACE}/store-recon-clone"
+
+          echo "Cloning target repository for commit..."
+          git config --global user.name "Tertiary Worker Bot"
+          git config --global user.email "bot@github.actions"
+          git clone "https://x-access-token:${STORE_RECON_PAT}@github.com/${STORE_RECON_REPO}.git" "$CLONE_DIR"
+          cd "$CLONE_DIR"
+
+          run_merge() {
+            for domain_dir in "${RESULTS_DIR}"/*; do
+              if [ ! -d "$domain_dir" ]; then continue; fi
+              domain_name=$(basename "$domain_dir")
+              dest_repo_dir="results/$domain_name"
+              mkdir -p "$dest_repo_dir"
+              
+              src_resolved="$domain_dir/resolved_subdomains.txt"
+              dest_puredns="$dest_repo_dir/puredns_results.txt"
+              if [ -s "$src_resolved" ]; then
+                temp_merged=$(mktemp)
+                if [ -f "$dest_puredns" ]; then cat "$src_resolved" "$dest_puredns" | sort -u > "$temp_merged"; else sort -u "$src_resolved" > "$temp_merged"; fi
+                mv "$temp_merged" "$dest_puredns"
+              fi
+              
+              src_ports="$domain_dir/subdomains_ports.txt"
+              dest_ports="$dest_repo_dir/subdomains_ports.txt"
+              if [ -s "$src_ports" ]; then
+                temp_merged=$(mktemp)
+                if [ -f "$dest_ports" ]; then cat "$src_ports" "$dest_ports" | sort -u > "$temp_merged"; else sort -u "$src_ports" > "$temp_merged"; fi
+                mv "$temp_merged" "$dest_ports"
+              fi
+            done
+            git add results/
+          }
+
+          run_merge
+          if git diff --cached --quiet; then
+            echo "No new unique data to commit."
+            exit 0
+          fi
+          
+          # Using the exact commit message pattern you requested
+          git commit -m "feat: Add resolved subdomains from distributed scan Correlation ID: ${CORRELATION_ID}"
+          
+          MAX_ATTEMPTS=5
+          for (( i=1; i<=MAX_ATTEMPTS; i++ )); do
+            echo "[Attempt $i/$MAX_ATTEMPTS] Pushing changes..."
+            if git push origin main; then
+              echo "✅ Successfully pushed results to store-recon."
+              exit 0
+            fi
+            echo "::warning:: Push failed. Retrying after pull/rebase..."
+            git fetch origin main
+            git reset --hard origin/main
+            run_merge
+            if git diff --cached --quiet; then
+              echo "No net new changes after syncing. Another worker likely pushed this data."
+              exit 0
+            fi
+            git commit -m "feat: Add resolved subdomains from distributed scan Correlation ID: ${CORRELATION_ID}"
+            sleep $(( 5 * i ))
+          done
+          
+          echo "::error:: All push attempts failed."
+          exit 0
