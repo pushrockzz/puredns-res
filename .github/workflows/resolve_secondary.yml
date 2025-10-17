@@ -75,34 +75,42 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-go-mod-
             
+
       - name: Download Chunks Package from Primary Workflow
         env:
           GH_TOKEN: ${{ secrets.PAT_FOR_PRIMARY_ARTIFACTS_READ }}
           PRIMARY_REPO: ${{ github.event.inputs.primary_repo }}
           PRIMARY_RUN_ID: ${{ github.event.inputs.primary_run_id }}
-          ARTIFACT_NAME: ${{ github.event.inputs.chunk_package_artifact_name }}
+          ARTIFACT_NAME: ${{ github.event.inputs.chunk_package_artifact_name }}          
         shell: bash
         run: |
 
-          echo "SECONDARY WORKER: Downloading artifact '$ARTIFACT_NAME' from '$PRIMARY_REPO', run ID '$PRIMARY_RUN_ID'"
+          echo "WORKER: Downloading artifact '${{ github.event.inputs.chunk_package_artifact_name }}'..."
           
-          # Install GitHub CLI
-          apt-get update -qy && apt-get install -qy curl
-          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
-          chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
-          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
-          apt-get update -qy && apt-get install -qy gh
+          # --- MODIFICATION: Added 'sudo' to all system commands ---
+          echo "Installing GitHub CLI with root privileges..."
+          sudo apt-get update -qy
+          sudo apt-get install -qy curl
+          
+          # Use a pipe to sudo tee for writing the keyring to a protected directory
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /usr/share/keyrings/githubcli-archive-keyring.gpg > /dev/null
+          
+          # Use a pipe to sudo tee for writing the source list
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          
+          sudo apt-get update -qy
+          sudo apt-get install -qy gh
+          # --- END MODIFICATION ---
 
-          # Download artifact
-          gh run download "$PRIMARY_RUN_ID" -R "$PRIMARY_REPO" -n "$ARTIFACT_NAME" --dir .
+          # Download artifact (this command does not need sudo)
+          gh run download ${{ github.event.inputs.primary_run_id }} -R ${{ github.event.inputs.primary_repo }} -n ${{ github.event.inputs.chunk_package_artifact_name }} --dir .
           
           if [ ! -d "chunks" ]; then
             echo "::error:: Artifact download failed or did not contain the 'chunks' directory."
             exit 0
           fi
           echo "Artifact downloaded successfully."
-          ls -l
-
+          
       - name: Ensure Tools are installed
         shell: bash
         run: |
