@@ -186,6 +186,8 @@ jobs:
       - name: Resolve, Filter, Scan, and Sort
         id: resolve_and_sort
         shell: bash
+        env:
+          TERM: xterm        
         run: |
           # This entire block is a direct copy of the processing logic from the Primary workflow
           # to ensure 100% consistency in results.
