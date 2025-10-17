@@ -96,12 +96,16 @@ jobs:
             exit 0
           fi
           
+          echo "Installing resolvers.txt"
+
+          wget -qO resolvers.txt https://raw.githubusercontent.com/and0x00/resolvers.txt/refs/heads/main/resolvers.txt          
+          
           # 1. Resolve with sanicdns (and required setup)
           chmod +x scripts/install-sanicdns.sh && scripts/install-sanicdns.sh
           SANICDNS_OUT="$JOB_OUTPUT_DIR/sanicdns_output.txt"
           sudo sanicdns \
             -i "$CHUNK_FILE" -r 1000 -c 3000 \
-            --resolvers resolvers-trusted.txt \
+            --resolvers resolvers.txt \
             -o "$SANICDNS_OUT" -w 4 --num-retries 7 --timeout 7000
 
           # 2. Filter and Process IPs
