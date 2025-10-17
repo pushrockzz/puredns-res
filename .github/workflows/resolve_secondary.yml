@@ -191,7 +191,7 @@ jobs:
         run: |
           # This entire block is a direct copy of the processing logic from the Primary workflow
           # to ensure 100% consistency in results.
-          set -e
+          
           CHUNK_FILE="${{ matrix.pair.chunk }}"
           JOB_OUTPUT_DIR="job_output"
           mkdir -p "$JOB_OUTPUT_DIR"
@@ -207,7 +207,7 @@ jobs:
           wget -qO resolvers.txt https://raw.githubusercontent.com/and0x00/resolvers.txt/refs/heads/main/resolvers.txt          
           
           # 1. Resolve with sanicdns (and required setup)
-          chmod +x scripts/install-sanicdns.sh && scripts/install-sanicdns.sh
+
           SANICDNS_OUT="$JOB_OUTPUT_DIR/sanicdns_output.txt"
           sudo sanicdns \
             -i "$CHUNK_FILE" -r 1000 -c 3000 \
