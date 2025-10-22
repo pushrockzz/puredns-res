@@ -144,7 +144,19 @@ jobs:
             go install -v github.com/tomnomnom/anew@latest
           else
             echo "anew already in cache"
-          fi    
+          fi  
+          
+          # Installing naabu Prerequisites
+          sudo apt install -y libpcap-dev
+
+          # Installing naabu
+          if ! command -v naabu >/dev/null; then
+            echo "Installing naabu…"
+            go install -v github.com/projectdiscovery/naabu/v2/cmd/naabu@latest
+          else
+            echo "naabu already in cache"
+          fi      
+          
       
       - name: Install pre‑reqs
         run: | 
@@ -183,14 +195,13 @@ jobs:
            # best-effort; if dpdk-hugepages.py isn't on PATH this will fail harmlessly
            sudo dpdk-hugepages.py --setup 2G || true
 
+           
       - name: Resolve, Filter, Scan, and Sort
         id: resolve_and_sort
         shell: bash
         env:
           TERM: xterm        
         run: |
-          # This entire block is a direct copy of the processing logic from the Primary workflow
-          # to ensure 100% consistency in results.
           
           CHUNK_FILE="${{ matrix.pair.chunk }}"
           JOB_OUTPUT_DIR="job_output"
@@ -201,48 +212,121 @@ jobs:
             echo "Chunk file is empty. Exiting."
             exit 0
           fi
-          
+
           echo "Installing resolvers.txt"
-
-          wget -qO resolvers.txt https://raw.githubusercontent.com/and0x00/resolvers.txt/refs/heads/main/resolvers.txt          
+          wget -qO resolvers.txt https://raw.githubusercontent.com/and0x00/resolvers.txt/refs/heads/main/resolvers.txt
           
-          # 1. Resolve with sanicdns (and required setup)
-
+          # 1. Resolve with sanicdns
           SANICDNS_OUT="$JOB_OUTPUT_DIR/sanicdns_output.txt"
-          sudo sanicdns \
-            -i "$CHUNK_FILE" -r 1000 -c 3000 \
-            --resolvers resolvers.txt \
-            -o "$SANICDNS_OUT" -w 4 --num-retries 7 --timeout 7000
+          LOG_FILE="$JOB_OUTPUT_DIR/wildcard_$(basename $CHUNK_FILE).log"
 
-          # 2. Filter and Process IPs
+          echo "Resolving chunk '$CHUNK_FILE'..."
+          sudo sanicdns \
+            -i "$CHUNK_FILE" \
+            -r 1000 \
+            -c 3000 \
+            -l "$LOG_FILE" \
+            --resolvers resolvers.txt \
+            -o "$SANICDNS_OUT"  \
+            -w 4 \
+            --num-retries 7 \
+            --timeout 7000
+            
+          # Define output files
           FILTER_OUT="$JOB_OUTPUT_DIR/sanicdns_filter.txt"
           IP_LIST="$JOB_OUTPUT_DIR/ip_list.txt"
           NON_CDN_IP="$JOB_OUTPUT_DIR/non_cdn_ip.txt"
-          SMAP_OUT="$JOB_OUTPUT_DIR/smap.txt"
+          CDN_IP="$JOB_OUTPUT_DIR/cdn_ip.txt"
+          NAABU_OUT="$JOB_OUTPUT_DIR/naabu.txt"
           SUBDOMAIN_PORTS="$JOB_OUTPUT_DIR/subdomains_ports.txt"
+
+          # 2. Filter ALL resolved subdomains (A, AAAA, CNAME) and extract unique IPs
+          echo "-> Step: Extracting all resolved subdomains (A, AAAA, CNAME)..."
+          jq -r 'select(.data.answers | length > 0) | .name | rtrimstr(".")' "$SANICDNS_OUT" | anew -q "$FILTER_OUT"
+          echo "-> Found $(wc -l < "$FILTER_OUT") total resolved subdomains."
           
-          jq -r 'select(.data.answers | any(.type=="A")) | .name | rtrimstr(".")' "$SANICDNS_OUT" | anew -q "$FILTER_OUT"
-          jq -r 'select(.data.answers | any(.type=="A")) | .data.answers[] | select(.type == "A") | .data' "$SANICDNS_OUT" | sort -u > "$IP_LIST"
-          
+          # Extract only IPs from A and AAAA records (CNAME doesn't have IPs directly)
+          echo "-> Step: Extracting unique IPs from A and AAAA records..."
+          jq -r '.data.answers[]? | select(.type == "A" or .type == "AAAA") | .data' "$SANICDNS_OUT" | sort -u > "$IP_LIST"
+          echo "-> Found $(wc -l < "$IP_LIST") total unique IPs."
+
+          # 3. Separate CDN and Non-CDN IPs
+          echo "-> Step: Using cut-cdn to filter for Non-CDN IPs..."
           cat "$IP_LIST" | cut-cdn -ua -silent -o "$NON_CDN_IP"
-          grep -Fxv -f "$NON_CDN_IP" "$IP_LIST" > "$JOB_OUTPUT_DIR/cdn_ip.txt" || true
-          
-          if [ -s "$NON_CDN_IP" ]; then smap -iL "$NON_CDN_IP" -oP "$SMAP_OUT"; else touch "$SMAP_OUT"; fi
-          
+          echo "-> Found $(wc -l < "$NON_CDN_IP") Non-CDN IPs."
+
+          echo "-> Step: Comparing non-cdn with IP list to aggregate CDN IPs..."
+          grep -Fxv -f "$NON_CDN_IP" "$IP_LIST" > "$CDN_IP" || true
+          echo "-> Found $(wc -l < "$CDN_IP") CDN IPs."
+
+          # 4. Prepare subdomain_ports.txt file
           touch "$SUBDOMAIN_PORTS"
           chmod +x map_IP_to_HOST.py
-          if [ -s "$SMAP_OUT" ]; then ./map_IP_to_HOST.py "$SANICDNS_OUT" "$SMAP_OUT" | anew -q "$SUBDOMAIN_PORTS"; fi
-          if [ -s "$JOB_OUTPUT_DIR/cdn_ip.txt" ]; then ./map_IP_to_HOST.py "$SANICDNS_OUT" "$JOB_OUTPUT_DIR/cdn_ip.txt" | anew -q "$SUBDOMAIN_PORTS"; fi
 
-          # 3. Sort results into root domain folders
+          # 5. Map CDN IPs directly to subdomains (no port scanning for CDN)
+          # This will include subdomains with CNAME -> CDN IP
+          if [ -s "$CDN_IP" ]; then
+            echo "-> Step: Mapping CDN IPs to subdomains (includes CNAME chains, ports 80,443 implied)..."
+            ./map_IP_to_HOST.py "$SANICDNS_OUT" "$CDN_IP" | anew -q "$SUBDOMAIN_PORTS"
+            echo "-> Mapped $(wc -l < "$CDN_IP") CDN IPs to subdomains."
+          fi
+
+          # 6. Map Non-CDN IPs directly to subdomains (ports 80,443 implied)
+          # This will include subdomains with CNAME -> Non-CDN IP
+          if [ -s "$NON_CDN_IP" ]; then
+            echo "-> Step: Mapping Non-CDN IPs to subdomains (includes CNAME chains, ports 80,443 implied)..."
+            ./map_IP_to_HOST.py "$SANICDNS_OUT" "$NON_CDN_IP" | anew -q "$SUBDOMAIN_PORTS"
+            echo "-> Mapped $(wc -l < "$NON_CDN_IP") Non-CDN IPs to subdomains."
+          fi
+
+          echo "-> Current entries in subdomains_ports.txt: $(wc -l < "$SUBDOMAIN_PORTS")"
+
+          # 7. Run naabu on Non-CDN IPs to find additional ports (excluding 80,443)
+          if [ -s "$NON_CDN_IP" ]; then
+            echo "-> Step: Running naabu in passive mode on Non-CDN IPs (excluding ports 80,443)..."
+            naabu -l "$NON_CDN_IP" \
+              -passive \
+              -exclude-ports 80,443 \
+              -silent \
+              -o "$NAABU_OUT" || true
+            
+            if [ -s "$NAABU_OUT" ]; then
+              echo "-> Naabu found $(wc -l < "$NAABU_OUT") IP:PORT combinations."
+              echo "-> Step: Mapping naabu results (IP:PORT) to subdomains (includes CNAME chains)..."
+              ./map_IP_to_HOST.py "$SANICDNS_OUT" "$NAABU_OUT" | anew -q "$SUBDOMAIN_PORTS"
+            else
+              echo "-> Naabu found no additional open ports (excluding 80,443)."
+            fi
+          else
+            echo "-> No Non-CDN IPs found. Skipping naabu scan."
+          fi
+
+          echo "-> Final mapping complete. Total entries in subdomains_ports.txt: $(wc -l < "$SUBDOMAIN_PORTS")"
+
+      - name: Sort Results into Root Domain Folders
+        shell: bash
+        run: |
           FINAL_SORTED_DIR="final_sorted"
+          FILTER_OUT="job_output/sanicdns_filter.txt"
+          SUBDOMAIN_PORTS="job_output/subdomains_ports.txt"
           mkdir -p "$FINAL_SORTED_DIR"
+          
+          if [ ! -s "$FILTER_OUT" ] && [ ! -s "$SUBDOMAIN_PORTS" ]; then
+            echo "No resolved domains or port data to sort."
+            exit 0
+          fi
           
           while read -r root_domain; do
             if [ -z "$root_domain" ]; then continue; fi
             mkdir -p "$FINAL_SORTED_DIR/$root_domain"
-            grep -E "(^|\\.)${root_domain//./\\.}(\$|:)" "$SUBDOMAIN_PORTS" | anew -q "$FINAL_SORTED_DIR/$root_domain/subdomains_ports.txt" || true
-            grep -E "(^|\\.)${root_domain//./\\.}(\$)" "$FILTER_OUT" | anew -q "$FINAL_SORTED_DIR/$root_domain/resolved_subdomains.txt" || true
+            # Sort the enriched subdomain:port results
+            if [ -s "$SUBDOMAIN_PORTS" ]; then
+              grep -E "(^|\\.)${root_domain//./\\.}(\$|:)" "$SUBDOMAIN_PORTS" | anew -q "$FINAL_SORTED_DIR/$root_domain/subdomains_ports.txt" || true
+            fi
+            # Sort the simple resolved subdomains
+            if [ -s "$FILTER_OUT" ]; then
+              grep -E "(^|\\.)${root_domain//./\\.}(\$)" "$FILTER_OUT" | anew -q "$FINAL_SORTED_DIR/$root_domain/resolved_subdomains.txt" || true
+            fi
           done < root_domains.txt
 
       - name: Upload Sorted Job Results
@@ -257,53 +341,101 @@ jobs:
     name: Merge All Distributed Results
     needs: process_assigned_chunks
     runs-on: ubuntu-latest
-    if: always()
+    if: always() # Run even if some primary chunks fail, to merge what's available
     outputs:
-      has_results: ${{ steps.consolidate.outputs.has_results }}
+      has_results: ${{ steps.deduplicate.outputs.has_results }}
     steps:
-      - name: Download All Job Results from All Workflows
-        env:
-          GH_TOKEN: ${{ secrets.PAT_FOR_PRIMARY_ARTIFACTS_READ }}
-        shell: bash
-        run: |
-          
-          # Install gh-cli if not present
-          sudo apt-get update -qy && sudo apt-get install -qy curl && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /usr/share/keyrings/githubcli-archive-keyring.gpg > /dev/null && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null && sudo apt-get update -qy && sudo apt-get install -qy gh
-          
-          echo "Downloading all artifacts from primary run ID: ${{ github.event.inputs.primary_run_id }}"
-          gh run download ${{ github.event.inputs.primary_run_id }} \
-            -R ${{ github.event.inputs.primary_repo }} \
-            -p 'job-results-*' \
-            --dir temp-aggregated-results
-          
-          if [ -z "$(ls -A temp-aggregated-results)" ]; then
-            echo "::warning:: No result artifacts found from any worker. Nothing to merge."
-            echo "HAS_RESULTS=false" >> $GITHUB_ENV
-          else
-            echo "HAS_RESULTS=true" >> $GITHUB_ENV
-          fi
 
-      - name: Consolidate and De-duplicate All Results
-        id: consolidate
-        if: env.HAS_RESULTS == 'true'
+      - name: Download All Primary Job Results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "job-results-secondary-*"
+          path: temp-aggregated-results
+
+
+      - name: De-duplicate and Verify Results
+        id: deduplicate
         shell: bash
         run: |
+          TEMP_DIR="temp-aggregated-results"
           FINAL_RESULTS_DIR="final-results"
+          
+          # Check if download produced any files
+          if [ ! -d "$TEMP_DIR" ] || [ -z "$(ls -A "$TEMP_DIR" 2>/dev/null)" ]; then
+            echo "::warning::No result artifacts were downloaded or they were empty."
+            echo "has_results=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
+          echo "Downloaded artifacts structure:"
+          ls -R "$TEMP_DIR"
+          
+          # Create final results directory
           mkdir -p "$FINAL_RESULTS_DIR"
-          echo "Aggregating results..."
-          find temp-aggregated-results -mindepth 1 -type d -exec cp -r {}/. "$FINAL_RESULTS_DIR" \;
-          echo "De-duplicating all result files..."
-          find "$FINAL_RESULTS_DIR" -type f -name "*.txt" -exec sort -u -o {} {} \;
-          echo "has_results=true" >> $GITHUB_OUTPUT
+          
+          echo "Merging and de-duplicating results from all artifacts..."
+          
+          # Find all domain directories across all downloaded artifacts
+          find "$TEMP_DIR" -mindepth 1 -maxdepth 1 -type d | while read -r domain_dir; do
+            domain_name=$(basename "$domain_dir")
+            dest_dir="$FINAL_RESULTS_DIR/$domain_name"
+            mkdir -p "$dest_dir"
+            
+            echo "Processing domain: $domain_name"
+            
+            # Merge resolved_subdomains.txt from all artifacts for this domain
+            if [ -f "$domain_dir/resolved_subdomains.txt" ]; then
+              cat "$domain_dir/resolved_subdomains.txt" >> "$dest_dir/resolved_subdomains.txt.tmp"
+            fi
+            
+            # Merge subdomains_ports.txt from all artifacts for this domain
+            if [ -f "$domain_dir/subdomains_ports.txt" ]; then
+              cat "$domain_dir/subdomains_ports.txt" >> "$dest_dir/subdomains_ports.txt.tmp"
+            fi
+          done
+          
+          # De-duplicate and sort all merged files
+          echo "De-duplicating all merged result files..."
+          find "$FINAL_RESULTS_DIR" -type f -name "*.tmp" | while read -r tmp_file; do
+            final_file="${tmp_file%.tmp}"
+            sort -u "$tmp_file" > "$final_file"
+            rm "$tmp_file"
+            echo "  - Merged $(wc -l < "$final_file") unique entries into $(basename "$final_file") for $(basename $(dirname "$final_file"))"
+          done
+          
+          # Remove empty directories
+          find "$FINAL_RESULTS_DIR" -type d -empty -delete
+          
+          # Final verification
+          if [ -z "$(ls -A "$FINAL_RESULTS_DIR" 2>/dev/null)" ]; then
+            echo "::warning::No results after merging and de-duplication."
+            echo "has_results=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
+          echo "has_results=true" >> "$GITHUB_OUTPUT"
+          echo "Final results structure:"
           ls -R "$FINAL_RESULTS_DIR"
+          
+          # Summary
+          echo ""
+          echo "=== Merge Summary ==="
+          for domain_dir in "$FINAL_RESULTS_DIR"/*; do
+            if [ -d "$domain_dir" ]; then
+              domain=$(basename "$domain_dir")
+              resolved_count=$(wc -l < "$domain_dir/resolved_subdomains.txt" 2>/dev/null || echo "0")
+              ports_count=$(wc -l < "$domain_dir/subdomains_ports.txt" 2>/dev/null || echo "0")
+              echo "  $domain: $resolved_count resolved subdomains, $ports_count with ports"
+            fi
+          done
 
-      - name: Upload Consolidated Artifact for Commit Job
-        if: steps.consolidate.outputs.has_results == 'true'
+      - name: Upload Final Consolidated Results
+        if: steps.deduplicate.outputs.has_results == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: consolidated-results-${{ github.event.inputs.primary_run_id }}
+          name: puredns-final-sorted-results
           path: final-results/
-          retention-days: 1
+          retention-days: 1    
 
   # This is the new, separate job for committing
   commit_results:
@@ -315,22 +447,22 @@ jobs:
       - name: Download Consolidated Results
         uses: actions/download-artifact@v4
         with:
-          name: consolidated-results-${{ github.event.inputs.primary_run_id }}
+          name: puredns-final-sorted-results
           path: final-results
 
       - name: Commit to 'store-recon' Repository
         env:
-          STORE_RECON_PAT: ${{ secrets.STORE_RECON_PAT_WRITE }}
+          STORE_RECON_PAT: ${{ secrets.STORE_RECON_PAT }}
           STORE_RECON_REPO: ${{ secrets.STORE_RECON_REPO }}
-          # The Correlation ID is taken directly from the trigger input
-          CORRELATION_ID: ${{ github.event.inputs.primary_run_id }}
+          # This logic safely gets the correlation ID regardless of trigger type
+          CORRELATION_ID: ${{ github.event.client_payload.run_id || github.run_id }}
         run: |
           
           RESULTS_DIR="${GITHUB_WORKSPACE}/final-results"
           CLONE_DIR="${GITHUB_WORKSPACE}/store-recon-clone"
 
           echo "Cloning target repository for commit..."
-          git config --global user.name "Tertiary Worker Bot"
+          git config --global user.name "Primary Worker Bot"
           git config --global user.email "bot@github.actions"
           git clone "https://x-access-token:${STORE_RECON_PAT}@github.com/${STORE_RECON_REPO}.git" "$CLONE_DIR"
           cd "$CLONE_DIR"
@@ -387,7 +519,7 @@ jobs:
             fi
             git commit -m "feat: Add resolved subdomains from distributed scan Correlation ID: ${CORRELATION_ID}"
             sleep $(( 5 * i ))
-          done
+          done       
           
           echo "::error:: All push attempts failed."
           exit 0
