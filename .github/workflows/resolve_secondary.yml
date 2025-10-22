@@ -488,9 +488,9 @@ jobs:
             fi
             
             echo "  $domain: $resolved_count resolved, $ports_count with ports"
-            ((total_domains++))
-            ((total_resolved+=resolved_count))
-            ((total_ports+=ports_count))
+            total_domains=$((total_domains + 1))
+            total_resolved=$((total_resolved + resolved_count))
+            total_ports=$((total_ports + ports_count))
           done
           
           echo ""
