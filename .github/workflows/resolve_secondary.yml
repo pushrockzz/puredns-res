@@ -375,32 +375,79 @@ jobs:
           
           echo "Merging and de-duplicating results from all artifacts..."
           
-          # Find all domain directories across all downloaded artifacts
-          find "$TEMP_DIR" -mindepth 1 -maxdepth 1 -type d | while read -r domain_dir; do
-            domain_name=$(basename "$domain_dir")
+          # Find all unique domain names across all artifacts
+          # Structure: temp-aggregated-results/job-results-primary-*/DOMAIN_NAME/
+          declare -A domains
+          
+          for artifact_dir in "$TEMP_DIR"/job-results-primary-*; do
+            if [ ! -d "$artifact_dir" ]; then continue; fi
+            
+            # Look INSIDE each artifact directory for domain directories
+            for domain_dir in "$artifact_dir"/*; do
+              if [ ! -d "$domain_dir" ]; then continue; fi
+              
+              domain_name=$(basename "$domain_dir")
+              domains["$domain_name"]=1
+              
+              echo "  Found domain: $domain_name in $(basename "$artifact_dir")"
+            done
+          done
+          
+          if [ ${#domains[@]} -eq 0 ]; then
+            echo "::warning::No domain directories found in artifacts."
+            echo "has_results=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
+          echo ""
+          echo "Found ${#domains[@]} unique domains to merge: ${!domains[@]}"
+          echo ""
+          
+          # Process each unique domain
+          for domain_name in "${!domains[@]}"; do
             dest_dir="$FINAL_RESULTS_DIR/$domain_name"
             mkdir -p "$dest_dir"
             
             echo "Processing domain: $domain_name"
             
-            # Merge resolved_subdomains.txt from all artifacts for this domain
-            if [ -f "$domain_dir/resolved_subdomains.txt" ]; then
-              cat "$domain_dir/resolved_subdomains.txt" >> "$dest_dir/resolved_subdomains.txt.tmp"
-            fi
+            # Merge resolved_subdomains.txt from ALL artifacts for this domain
+            for artifact_dir in "$TEMP_DIR"/job-results-primary-*; do
+              source_file="$artifact_dir/$domain_name/resolved_subdomains.txt"
+              if [ -f "$source_file" ]; then
+                echo "  - Merging resolved_subdomains.txt from $(basename "$artifact_dir")"
+                cat "$source_file" >> "$dest_dir/resolved_subdomains.txt.tmp"
+              fi
+            done
             
-            # Merge subdomains_ports.txt from all artifacts for this domain
-            if [ -f "$domain_dir/subdomains_ports.txt" ]; then
-              cat "$domain_dir/subdomains_ports.txt" >> "$dest_dir/subdomains_ports.txt.tmp"
-            fi
+            # Merge subdomains_ports.txt from ALL artifacts for this domain
+            for artifact_dir in "$TEMP_DIR"/job-results-primary-*; do
+              source_file="$artifact_dir/$domain_name/subdomains_ports.txt"
+              if [ -f "$source_file" ]; then
+                echo "  - Merging subdomains_ports.txt from $(basename "$artifact_dir")"
+                cat "$source_file" >> "$dest_dir/subdomains_ports.txt.tmp"
+              fi
+            done
           done
           
-          # De-duplicate and sort all merged files
+          echo ""
           echo "De-duplicating all merged result files..."
+          
           find "$FINAL_RESULTS_DIR" -type f -name "*.tmp" | while read -r tmp_file; do
             final_file="${tmp_file%.tmp}"
+            
+            if [ ! -s "$tmp_file" ]; then
+              echo "  - Skipping empty file: $tmp_file"
+              rm "$tmp_file"
+              continue
+            fi
+            
             sort -u "$tmp_file" > "$final_file"
             rm "$tmp_file"
-            echo "  - Merged $(wc -l < "$final_file") unique entries into $(basename "$final_file") for $(basename $(dirname "$final_file"))"
+            
+            entries=$(wc -l < "$final_file")
+            domain=$(basename $(dirname "$final_file"))
+            filename=$(basename "$final_file")
+            echo "  - $domain/$filename: $entries unique entries"
           done
           
           # Remove empty directories
@@ -414,20 +461,40 @@ jobs:
           fi
           
           echo "has_results=true" >> "$GITHUB_OUTPUT"
-          echo "Final results structure:"
+          echo ""
+          echo "=== Final Results Structure ==="
           ls -R "$FINAL_RESULTS_DIR"
           
           # Summary
           echo ""
           echo "=== Merge Summary ==="
+          total_domains=0
+          total_resolved=0
+          total_ports=0
+          
           for domain_dir in "$FINAL_RESULTS_DIR"/*; do
-            if [ -d "$domain_dir" ]; then
-              domain=$(basename "$domain_dir")
-              resolved_count=$(wc -l < "$domain_dir/resolved_subdomains.txt" 2>/dev/null || echo "0")
-              ports_count=$(wc -l < "$domain_dir/subdomains_ports.txt" 2>/dev/null || echo "0")
-              echo "  $domain: $resolved_count resolved subdomains, $ports_count with ports"
+            if [ ! -d "$domain_dir" ]; then continue; fi
+            
+            domain=$(basename "$domain_dir")
+            resolved_count=0
+            ports_count=0
+            
+            if [ -f "$domain_dir/resolved_subdomains.txt" ]; then
+              resolved_count=$(wc -l < "$domain_dir/resolved_subdomains.txt")
             fi
+            
+            if [ -f "$domain_dir/subdomains_ports.txt" ]; then
+              ports_count=$(wc -l < "$domain_dir/subdomains_ports.txt")
+            fi
+            
+            echo "  $domain: $resolved_count resolved, $ports_count with ports"
+            ((total_domains++))
+            ((total_resolved+=resolved_count))
+            ((total_ports+=ports_count))
           done
+          
+          echo ""
+          echo "Total: $total_domains domains, $total_resolved resolved subdomains, $total_ports with ports"
 
       - name: Upload Final Consolidated Results
         if: steps.deduplicate.outputs.has_results == 'true'
