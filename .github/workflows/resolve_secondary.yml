@@ -353,7 +353,7 @@ jobs:
           path: temp-aggregated-results
 
 
-- name: De-duplicate and Verify Results
+      - name: De-duplicate and Verify Results
         id: deduplicate
         shell: bash
         run: |
