@@ -353,7 +353,7 @@ jobs:
           path: temp-aggregated-results
 
 
-      - name: De-duplicate and Verify Results
+- name: De-duplicate and Verify Results
         id: deduplicate
         shell: bash
         run: |
@@ -376,11 +376,13 @@ jobs:
           echo "Merging and de-duplicating results from all artifacts..."
           
           # Find all unique domain names across all artifacts
-          # Structure: temp-aggregated-results/job-results-primary-*/DOMAIN_NAME/
+          # Works with ANY artifact naming pattern
           declare -A domains
           
-          for artifact_dir in "$TEMP_DIR"/job-results-primary-*; do
+          for artifact_dir in "$TEMP_DIR"/*; do
             if [ ! -d "$artifact_dir" ]; then continue; fi
+            
+            echo "Scanning artifact: $(basename "$artifact_dir")"
             
             # Look INSIDE each artifact directory for domain directories
             for domain_dir in "$artifact_dir"/*; do
@@ -411,7 +413,9 @@ jobs:
             echo "Processing domain: $domain_name"
             
             # Merge resolved_subdomains.txt from ALL artifacts for this domain
-            for artifact_dir in "$TEMP_DIR"/job-results-primary-*; do
+            for artifact_dir in "$TEMP_DIR"/*; do
+              if [ ! -d "$artifact_dir" ]; then continue; fi
+              
               source_file="$artifact_dir/$domain_name/resolved_subdomains.txt"
               if [ -f "$source_file" ]; then
                 echo "  - Merging resolved_subdomains.txt from $(basename "$artifact_dir")"
@@ -420,7 +424,9 @@ jobs:
             done
             
             # Merge subdomains_ports.txt from ALL artifacts for this domain
-            for artifact_dir in "$TEMP_DIR"/job-results-primary-*; do
+            for artifact_dir in "$TEMP_DIR"/*; do
+              if [ ! -d "$artifact_dir" ]; then continue; fi
+              
               source_file="$artifact_dir/$domain_name/subdomains_ports.txt"
               if [ -f "$source_file" ]; then
                 echo "  - Merging subdomains_ports.txt from $(basename "$artifact_dir")"
